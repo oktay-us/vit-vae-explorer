@@ -1,0 +1,7 @@
+# CPU-only dependencies for the Docker container (inference only, no training).
+# PyTorch is installed separately in the Dockerfile to use the CPU wheel index.
+einops
+gradio>=4.0
+numpy
+pillow
+matplotlib
