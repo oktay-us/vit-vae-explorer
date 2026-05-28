@@ -27,6 +27,7 @@ from PIL import Image
 # Allow imports from the project root regardless of where the script is called from.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from src.classifier import CLASS_NAMES, CLASSIFIER_PATH, LatentClassifier
 from src.model import ViTVAE
 from src.utils import interpolate, preprocess_image, tensor_to_numpy
 
@@ -57,6 +58,29 @@ else:
 model = model.to(device)
 model.eval()
 
+# Load the latent classifier (optional — app still works without it).
+classifier = LatentClassifier()
+if os.path.exists(CLASSIFIER_PATH):
+    classifier.load_state_dict(torch.load(CLASSIFIER_PATH, map_location=device))
+    print(f"Loaded classifier from {CLASSIFIER_PATH}")
+else:
+    print("No classifier found — run: python src/classifier.py")
+classifier = classifier.to(device)
+classifier.eval()
+
+
+def classify_z(z: torch.Tensor) -> dict:
+    """
+    Classifies a latent vector and returns a dict of {class_name: confidence}
+    suitable for gr.Label().
+
+    Input: z (1, 32)
+    """
+    with torch.no_grad():
+        logits = classifier(z)              # (1, 10)
+        probs  = torch.softmax(logits, dim=-1).squeeze()  # (10,)
+    return {CLASS_NAMES[i]: float(probs[i]) for i in range(10)}
+
 # ---------------------------------------------------------------------------
 # Tab 1: Reconstruct
 # ---------------------------------------------------------------------------
@@ -83,7 +107,8 @@ def reconstruct(pil_img):
         z = mu                               # use the mean (no noise) for a deterministic result
         x_recon = model.decode(z)            # (1, 1, 28, 28)
 
-    recon_img = tensor_to_numpy(x_recon)    # (28, 28) uint8
+    arr = tensor_to_numpy(x_recon)           # (28, 28) uint8
+    recon_img = np.array(Image.fromarray(arr).resize((280, 280), Image.NEAREST))
 
     # Build a bar chart showing the value of each latent dimension.
     mu_np = mu.squeeze().cpu().numpy()      # (32,)
@@ -97,7 +122,9 @@ def reconstruct(pil_img):
     ax.set_xlim(-0.5, 31.5)
     fig.tight_layout()
 
-    return recon_img, fig
+    label_probs = classify_z(z)
+
+    return recon_img, fig, label_probs
 
 
 # ---------------------------------------------------------------------------
@@ -137,6 +164,9 @@ def interpolate_images(pil_img1, pil_img2):
 # Tab 3: Latent Sampler
 # ---------------------------------------------------------------------------
 
+DISPLAY_SIZE = 280   # upscale 28×28 → 280×280 for easier viewing
+
+
 def decode_from_sliders(*slider_vals):
     """
     Decodes a latent vector constructed from the 32 slider values.
@@ -146,24 +176,26 @@ def decode_from_sliders(*slider_vals):
         *slider_vals : 32 float values (one per slider)
 
     Returns:
-        (28, 28) uint8 numpy array — decoded image
+        (280, 280) uint8 numpy array — decoded image upscaled for display
     """
-    # Collect all 32 slider values into a tensor.
     z = torch.tensor(list(slider_vals), dtype=torch.float32)  # (32,)
     z = z.unsqueeze(0).to(device)                              # (1, 32)
 
     with torch.no_grad():
         x_recon = model.decode(z)   # (1, 1, 28, 28)
 
-    return tensor_to_numpy(x_recon)  # (28, 28) uint8
+    arr = tensor_to_numpy(x_recon)  # (28, 28) uint8
+    arr = np.array(Image.fromarray(arr).resize((DISPLAY_SIZE, DISPLAY_SIZE), Image.NEAREST))
+    label_probs = classify_z(z)
+    return arr, label_probs
 
 
 def random_sample_values():
     """
-    Draws a random latent vector from the prior N(0, I) and returns
-    32 individual values to update all sliders simultaneously.
+    Draws a random latent vector from the prior N(0, I), clamped to [−3, 3]
+    so values never exceed the slider range.
     """
-    z = torch.randn(32)                         # (32,)
+    z = torch.randn(32).clamp(-3.0, 3.0)   # (32,) — hard clamp to slider bounds
     return [float(z[i].item()) for i in range(32)]
 
 
@@ -193,10 +225,12 @@ with gr.Blocks(title="ViT-VAE Latent Space Explorer") as demo:
                 recon_output = gr.Image(label="Reconstruction", image_mode="L")
         latent_chart = gr.Plot(label="Latent vector (μ)")
 
+        recon_label = gr.Label(num_top_classes=3, label="Predicted class")
+
         recon_btn.click(
             fn=reconstruct,
             inputs=recon_input,
-            outputs=[recon_output, latent_chart],
+            outputs=[recon_output, latent_chart, recon_label],
         )
 
     # ── Tab 2: Interpolate ──────────────────────────────────────────────────
@@ -229,29 +263,32 @@ with gr.Blocks(title="ViT-VAE Latent Space Explorer") as demo:
             "Move any slider to watch the decoded image update in real time. "
             "Click **Random Sample** to draw a random point from the prior N(0, I)."
         )
-        sampler_output = gr.Image(label="Decoded image", image_mode="L")
+        with gr.Row():
+            sampler_output = gr.Image(label="Decoded image", image_mode="L")
+            sampler_label  = gr.Label(num_top_classes=3, label="Predicted class")
         random_btn = gr.Button("Random Sample")
 
-        # Build 32 sliders programmatically; 4 per row for a compact layout.
+        # 8 sliders per row → more compact layout.
         sliders = []
-        for row_start in range(0, 32, 4):
+        for row_start in range(0, 32, 8):
             with gr.Row():
-                for i in range(row_start, min(row_start + 4, 32)):
+                for i in range(row_start, min(row_start + 8, 32)):
                     s = gr.Slider(
                         minimum=-3.0,
                         maximum=3.0,
                         value=0.0,
                         step=0.05,
                         label=f"z[{i}]",
+                        min_width=80,
                     )
                     sliders.append(s)
 
-        # Any slider change re-runs the decode.
+        # Any slider change re-runs the decode and classification.
         for slider in sliders:
             slider.change(
                 fn=decode_from_sliders,
                 inputs=sliders,
-                outputs=sampler_output,
+                outputs=[sampler_output, sampler_label],
             )
 
         # Random Sample resets all sliders, which triggers the decode chain.
